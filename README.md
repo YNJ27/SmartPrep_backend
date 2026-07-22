@@ -1,6 +1,6 @@
-# SPPU Questions Server
+# SmartPrep Backend
 
-**SPPU Questions Server** is an automated backend system designed to extract, process, and semantically group university exam questions from raw PDF papers.
+**SmartPrep** is an automated system designed to extract, process, and semantically group university exam questions from raw PDF papers.
 This backend handles everything from OCR conversion to intelligent clustering, HTML snapshot generation, and cloud synchronization.
 
 ## 📌 Features

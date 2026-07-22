@@ -1,0 +1,9 @@
+sppu/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.env
+.env.*
+
+.vscode/

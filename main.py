@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Response, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Response, Request, Cookie, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
@@ -33,17 +33,106 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("Warning: Missing Supabase credentials in .env")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class SessionPayload(BaseModel):
+    access_token: str
+    refresh_token: str
+
+def _set_session_cookies(response: Response, access_token: str, refresh_token: str, expires_in: int) -> None:
+    response.set_cookie(
+        "access_token", access_token, httponly=True, secure=COOKIE_SECURE,
+        samesite="lax", max_age=expires_in, path="/",
+    )
+    response.set_cookie(
+        "refresh_token", refresh_token, httponly=True, secure=COOKIE_SECURE,
+        samesite="lax", max_age=60 * 60 * 24 * 30, path="/",
+    )
+
+@app.post("/auth/session")
+def create_session_from_tokens(payload: SessionPayload, response: Response):
+    """Frontend hands off a session obtained via supabase-js. We verify the
+    access_token is genuinely valid before trusting it, then store both
+    tokens as httpOnly cookies. This is the ONLY place tokens cross from
+    JS-visible memory into the browser at all, and only as httpOnly cookies
+    JS cannot read."""
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    try:
+        res = supabase_admin.auth.get_user(payload.access_token)
+        if not res or not res.user:
+            raise HTTPException(status_code=401, detail="Invalid session token")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
+
+    _set_session_cookies(response, payload.access_token, payload.refresh_token, expires_in=3600)
+    return {"message": "Session established", "user_id": res.user.id}
+
+async def get_current_user(
+    response: Response,
+    access_token: str | None = Cookie(default=None),
+    refresh_token: str | None = Cookie(default=None),
+):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        res = supabase_admin.auth.get_user(access_token)
+        if res and res.user:
+            return res.user
+    except Exception:
+        pass  # fall through to refresh attempt
+
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    try:
+        refreshed = supabase_admin.auth.refresh_session(refresh_token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Session expired: {e}")
+
+    if not refreshed or not refreshed.session:
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    _set_session_cookies(
+        response,
+        refreshed.session.access_token,
+        refreshed.session.refresh_token,
+        expires_in=refreshed.session.expires_in or 3600,
+    )
+    return refreshed.session.user
+
+@app.get("/auth/me")
+def get_me(current_user = Depends(get_current_user)):
+    return {"user_id": current_user.id, "email": current_user.email}
+
+@app.post("/auth/logout")
+def logout(response: Response):
+    if supabase_admin:
+        try:
+            supabase_admin.auth.sign_out()
+        except Exception:
+            pass
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+    return {"message": "Logged out successfully"}
 
 class FileItem(BaseModel):
     id: str
@@ -60,7 +149,6 @@ class SubjectPayload(BaseModel):
     examType: str
     metadata: MetadataItem
     files: list[FileItem]
-    user_id: str
 
 def _safe_folder_name(name: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]+', "_", name.strip())
@@ -148,9 +236,9 @@ def _run_orchestrator(
                 frontend_error = _ERR_GENERIC
                 print(f"[Background Task] Orchestrator failed with exit code {returncode} for run_id {run_id}", file=sys.stderr)
 
-            if supabase:
+            if supabase_admin:
                 try:
-                    supabase.table("processed_subjects").update({
+                    supabase_admin.table("processed_subjects").update({
                         "status": "failed",
                         "error_message": frontend_error
                     }).eq("file_hash", file_hash).eq("run_id", run_id).execute()
@@ -162,14 +250,14 @@ def _run_orchestrator(
         grouped_dir = SUBJECTS_DIR / run_folder / "grouped_questions"
         storage_prefix = f"{_safe_folder_name(branch)}/{_safe_folder_name(year)}/{_safe_folder_name(pattern)}/{_safe_folder_name(subject)}/{_safe_folder_name(exam_type)}"
 
-        if grouped_dir.exists() and supabase:
+        if grouped_dir.exists() and supabase_admin:
             for json_file in grouped_dir.glob("*.json"):
                 try:
                     with json_file.open("rb") as f:
                         file_bytes = f.read()
                     storage_path = f"{storage_prefix}/{json_file.name}"
                     # upsert=True replaces if exists
-                    supabase.storage.from_("grouped-questions").upload(
+                    supabase_admin.storage.from_("grouped-questions").upload(
                         file=file_bytes,
                         path=storage_path,
                         file_options={"cacheControl": "3600", "upsert": "true", "contentType": "application/json"}
@@ -179,9 +267,9 @@ def _run_orchestrator(
 
         # Mark as completed in DB (clear any stale error_message from a prior failed run)
         now_iso = datetime.now(timezone.utc).isoformat()
-        if supabase:
+        if supabase_admin:
             try:
-                supabase.table("processed_subjects").update({
+                supabase_admin.table("processed_subjects").update({
                     "status": "completed",
                     "storage_path": storage_prefix,
                     "processed_at": now_iso,
@@ -195,9 +283,9 @@ def _run_orchestrator(
     except Exception as e:
         # Catch-all for unexpected errors (e.g. subprocess itself failing to launch)
         print(f"[Background Task] Unexpected error running orchestrator for run_id {run_id}: {e}", file=sys.stderr)
-        if supabase:
+        if supabase_admin:
             try:
-                supabase.table("processed_subjects").update({
+                supabase_admin.table("processed_subjects").update({
                     "status": "failed",
                     "error_message": _ERR_GENERIC
                 }).eq("file_hash", file_hash).eq("run_id", run_id).execute()
@@ -233,15 +321,16 @@ def _cleanup_stale_run_folder(run_id: str | None) -> None:
 @app.post("/subjects/import-pdfs")
 def import_subject_pdfs(
     payload: SubjectPayload,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    current_user = Depends(get_current_user)
 ) -> dict[str, Any]:
     file_hash = compute_file_hash(payload.files)
     
-    if not supabase:
+    if not supabase_admin:
         raise HTTPException(status_code=500, detail="Supabase not configured")
 
     # 1. Fast-path: check for an already-completed or actively-pending record.
-    res = supabase.table("processed_subjects").select("*").eq("file_hash", file_hash).execute()
+    res = supabase_admin.table("processed_subjects").select("*").eq("file_hash", file_hash).execute()
 
     if len(res.data) > 0:
         row = res.data[0]
@@ -280,7 +369,7 @@ def import_subject_pdfs(
                         print(f"[Import] Stale lock detected for file_hash={file_hash}. Cleaning up old run folder.")
                         _cleanup_stale_run_folder(row.get("run_id"))
                         try:
-                            supabase.table("processed_subjects").update({
+                            supabase_admin.table("processed_subjects").update({
                                 "status": "failed",
                                 "error_message": "Previous processing attempt timed out."
                             }).eq("file_hash", file_hash).execute()
@@ -309,7 +398,7 @@ def import_subject_pdfs(
     run_id = str(uuid.uuid4())
 
     try:
-        supabase.table("processed_subjects").insert({
+        supabase_admin.table("processed_subjects").insert({
             "subject": payload.subject,
             "exam_type": payload.examType,
             "branch": payload.metadata.Branch,
@@ -331,7 +420,7 @@ def import_subject_pdfs(
     # 3. Re-read the authoritative row from the DB.
     #    This is the source of truth regardless of what happened above.
     try:
-        verify_res = supabase.table("processed_subjects").select("*").eq("file_hash", file_hash).execute()
+        verify_res = supabase_admin.table("processed_subjects").select("*").eq("file_hash", file_hash).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to verify lock: {str(e)}")
 
@@ -369,7 +458,7 @@ def import_subject_pdfs(
         # done in the fast-path above).  Reset it with our new run_id so the
         # pipeline can start fresh.
         try:
-            supabase.table("processed_subjects").update({
+            supabase_admin.table("processed_subjects").update({
                 "subject": payload.subject,
                 "exam_type": payload.examType,
                 "branch": payload.metadata.Branch,
@@ -425,7 +514,7 @@ def import_subject_pdfs(
         )
 
         try:
-            supabase.table("processed_subjects").update({
+            supabase_admin.table("processed_subjects").update({
                 "status": "failed",
                 "error_message": download_error_msg
             }).eq("file_hash", file_hash).execute()
@@ -450,7 +539,7 @@ def import_subject_pdfs(
         year=payload.metadata.Year,
         pattern=payload.metadata.Pattern,
         file_hash=file_hash,
-        user_id=payload.user_id
+        user_id=current_user.id
     )
 
     return {
@@ -463,12 +552,12 @@ def import_subject_pdfs(
 
 
 @app.get("/subjects/status/{file_hash}")
-def get_subject_status(file_hash: str) -> dict[str, Any]:
+def get_subject_status(file_hash: str, current_user = Depends(get_current_user)) -> dict[str, Any]:
     """Returns the current processing status from Supabase using the file hash."""
-    if not supabase:
+    if not supabase_admin:
         raise HTTPException(status_code=500, detail="Supabase not configured")
     try:
-        res = supabase.table("processed_subjects").select("*").eq("file_hash", file_hash).execute()
+        res = supabase_admin.table("processed_subjects").select("*").eq("file_hash", file_hash).execute()
     except Exception as e:
         # Handle network or protocol errors without retrying
         raise HTTPException(status_code=500, detail=f"Failed to fetch status: {str(e)}")
@@ -486,6 +575,7 @@ def get_subject_status(file_hash: str) -> dict[str, Any]:
 def get_grouped_questions(
     subject: str,
     exam_type: str = Query(default="", alias="examType"),
+    current_user = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
     """Returns all grouped unit question JSONs for a subject from Supabase Storage.
     
@@ -494,11 +584,11 @@ def get_grouped_questions(
         exam_type: Optional exam type filter, e.g. 'Endsem' or 'Insem' (query parameter).
                    When provided, only records matching that exam type are considered.
     """
-    if not supabase:
+    if not supabase_admin:
         raise HTTPException(status_code=500, detail="Supabase not configured")
 
     query = (
-        supabase.table("processed_subjects")
+        supabase_admin.table("processed_subjects")
         .select("storage_path")
         .eq("subject", subject)
         .eq("status", "completed")
@@ -519,7 +609,7 @@ def get_grouped_questions(
     if not storage_prefix:
         raise HTTPException(status_code=500, detail="Invalid storage path in database.")
 
-    list_res = supabase.storage.from_("grouped-questions").list(storage_prefix)
+    list_res = supabase_admin.storage.from_("grouped-questions").list(storage_prefix)
     
     if not list_res or not isinstance(list_res, list):
         raise HTTPException(
@@ -539,7 +629,7 @@ def get_grouped_questions(
         
         file_path = f"{storage_prefix}/{file_name}"
         try:
-            res_bytes = supabase.storage.from_("grouped-questions").download(file_path)
+            res_bytes = supabase_admin.storage.from_("grouped-questions").download(file_path)
             questions = json.loads(res_bytes.decode("utf-8"))
             results.append({"unit": unit_number, "questions": questions})
         except Exception as exc:
@@ -553,15 +643,173 @@ def get_grouped_questions(
 
     return results
 
+class UserSubjectPayload(BaseModel):
+    subject: str
+    examType: str
+    Branch: str
+    Year: str
+    Pattern: str
+
+@app.post("/user/subjects")
+def save_user_subject(payload: UserSubjectPayload, current_user = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    try:
+        # Use upsert to avoid duplicate row errors if the user processes the same subject again
+        supabase_admin.table("user_subjects").upsert({
+            "user_id": current_user.id,
+            "subject": payload.subject,
+            "examType": payload.examType,
+            "Branch": payload.Branch,
+            "Year": payload.Year,
+            "Pattern": payload.Pattern
+        }).execute()
+        return {"message": "Subject saved successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/user/subjects")
+def get_user_subjects(current_user = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    res = supabase_admin.table("user_subjects").select("*").eq("user_id", current_user.id).order("added_at", desc=True).execute()
+    return res.data
+
+@app.delete("/user/subjects/{subject_id}")
+def delete_user_subject(subject_id: int, current_user = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    subject_res = supabase_admin.table("user_subjects").select("*").eq("id", subject_id).eq("user_id", current_user.id).execute()
+    if not subject_res.data:
+        raise HTTPException(status_code=404, detail="Subject not found")
+        
+    subject_row = subject_res.data[0]
+    supabase_admin.table("user_subjects").delete().eq("id", subject_id).execute()
+    
+    match_dict = {
+        "user_id": current_user.id,
+        "subject": subject_row["subject"],
+        "examType": subject_row["examType"],
+        "Branch": subject_row["Branch"],
+        "Year": subject_row["Year"],
+        "Pattern": subject_row["Pattern"]
+    }
+    
+    supabase_admin.table("user_group_status").delete().match(match_dict).execute()
+    supabase_admin.table("user_question_progress").delete().match(match_dict).execute()
+    return {"message": "Subject and progress deleted"}
+
+@app.get("/user/progress")
+def get_user_progress(
+    subject: str, examType: str, Branch: str, Year: str, Pattern: str, unit_number: int,
+    current_user = Depends(get_current_user)
+):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+        
+    match_dict = {
+        "user_id": current_user.id, "subject": subject, "examType": examType,
+        "Branch": Branch, "Year": Year, "Pattern": Pattern, "unit_number": unit_number
+    }
+    status_res = supabase_admin.table("user_group_status").select("group_id, status").match(match_dict).execute()
+    progress_res = supabase_admin.table("user_question_progress").select("group_id, question_id, is_done").match(match_dict).execute()
+    return {"group_status": status_res.data, "question_progress": progress_res.data}
+
+class GroupStatusPayload(BaseModel):
+    subject: str
+    examType: str
+    Branch: str
+    Year: str
+    Pattern: str
+    unit_number: int
+    group_id: int
+    status: str
+
+@app.post("/user/group-status")
+def save_group_status(payload: GroupStatusPayload, current_user = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+        
+    match_dict = {
+        "user_id": current_user.id, "subject": payload.subject, "examType": payload.examType,
+        "Branch": payload.Branch, "Year": payload.Year, "Pattern": payload.Pattern,
+        "unit_number": payload.unit_number, "group_id": payload.group_id
+    }
+    
+    if payload.status == "unattempted":
+        supabase_admin.table("user_group_status").delete().match(match_dict).execute()
+    else:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        res = supabase_admin.table("user_group_status").update({"status": payload.status, "updated_at": now_iso}).match(match_dict).execute()
+        if not res.data:
+            supabase_admin.table("user_group_status").insert({**match_dict, "status": payload.status, "updated_at": now_iso}).execute()
+    return {"message": "Group status updated"}
+
+class QuestionProgressPayload(BaseModel):
+    subject: str
+    examType: str
+    Branch: str
+    Year: str
+    Pattern: str
+    unit_number: int
+    group_id: int
+    question_id: str
+    is_done: bool
+
+@app.post("/user/question-progress")
+def save_question_progress(payload: QuestionProgressPayload, current_user = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+        
+    match_dict = {
+        "user_id": current_user.id, "subject": payload.subject, "examType": payload.examType,
+        "Branch": payload.Branch, "Year": payload.Year, "Pattern": payload.Pattern,
+        "unit_number": payload.unit_number, "group_id": payload.group_id, "question_id": payload.question_id
+    }
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
+    res = supabase_admin.table("user_question_progress").update({"is_done": payload.is_done, "updated_at": now_iso}).match(match_dict).execute()
+    if not res.data:
+        supabase_admin.table("user_question_progress").insert({**match_dict, "is_done": payload.is_done, "updated_at": now_iso}).execute()
+    return {"message": "Question progress updated"}
+
+class GroupResetPayload(BaseModel):
+    subject: str
+    examType: str
+    Branch: str
+    Year: str
+    Pattern: str
+    unit_number: int
+    group_id: int
+
+@app.post("/user/group-reset")
+def reset_group_progress(payload: GroupResetPayload, current_user = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+        
+    match_dict = {
+        "user_id": current_user.id, "subject": payload.subject, "examType": payload.examType,
+        "Branch": payload.Branch, "Year": payload.Year, "Pattern": payload.Pattern,
+        "unit_number": payload.unit_number, "group_id": payload.group_id
+    }
+    supabase_admin.table("user_question_progress").delete().match(match_dict).execute()
+    return {"message": "Group progress reset"}
+
 class APIKeyPayload(BaseModel):
     provider: str
     api_key: str
-    user_id: str
 
+@app.get("/user/api-keys")
+def get_user_api_keys(current_user = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    res = supabase_admin.table("user_api_keys").select("provider").eq("user_id", current_user.id).execute()
+    return {"providers": [row["provider"] for row in res.data]}
 
 @app.post("/user/api-keys")
-def save_api_key(payload: APIKeyPayload) -> dict[str, Any]:
-    if not supabase:
+def save_api_key(payload: APIKeyPayload, current_user = Depends(get_current_user)) -> dict[str, Any]:
+    if not supabase_admin:
         raise HTTPException(status_code=500, detail="Supabase not configured")
     
     try:
@@ -569,8 +817,8 @@ def save_api_key(payload: APIKeyPayload) -> dict[str, Any]:
         encrypted_key = encrypt_api_key(payload.api_key)
         
         # Upsert the key
-        supabase.table("user_api_keys").upsert({
-            "user_id": payload.user_id,
+        supabase_admin.table("user_api_keys").upsert({
+            "user_id": current_user.id,
             "provider": payload.provider,
             "encrypted_api_key": encrypted_key
         }, on_conflict="user_id,provider").execute()

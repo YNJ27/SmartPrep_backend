@@ -22,6 +22,7 @@ eval_type_backport==0.4.0
 fastapi==0.137.2
 frozenlist==1.8.0
 greenlet==3.5.4
+gunicorn==26.0.0
 h11==0.16.0
 h2==4.4.0
 hpack==4.2.0

@@ -676,7 +676,7 @@ def get_user_subjects(current_user = Depends(get_current_user)):
     return res.data
 
 @app.delete("/user/subjects/{subject_id}")
-def delete_user_subject(subject_id: int, current_user = Depends(get_current_user)):
+def delete_user_subject(subject_id: str, current_user = Depends(get_current_user)):
     if not supabase_admin:
         raise HTTPException(status_code=500, detail="Supabase not configured")
     

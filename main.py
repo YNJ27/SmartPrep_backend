@@ -36,6 +36,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN") or None
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
 app = FastAPI()
@@ -56,10 +57,12 @@ def _set_session_cookies(response: Response, access_token: str, refresh_token: s
     response.set_cookie(
         "access_token", access_token, httponly=True, secure=COOKIE_SECURE,
         samesite="none", max_age=expires_in, path="/",
+        domain=COOKIE_DOMAIN,   # <-- add this
     )
     response.set_cookie(
         "refresh_token", refresh_token, httponly=True, secure=COOKIE_SECURE,
         samesite="none", max_age=60 * 60 * 24 * 30, path="/",
+        domain=COOKIE_DOMAIN,   # <-- add this
     )
 
 @app.post("/auth/session")
@@ -130,8 +133,8 @@ def logout(response: Response):
             supabase_admin.auth.sign_out()
         except Exception:
             pass
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+    response.delete_cookie("access_token", path="/", domain=COOKIE_DOMAIN)
+    response.delete_cookie("refresh_token", path="/", domain=COOKIE_DOMAIN)
     return {"message": "Logged out successfully"}
 
 class FileItem(BaseModel):

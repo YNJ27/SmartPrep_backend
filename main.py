@@ -55,11 +55,11 @@ class SessionPayload(BaseModel):
 def _set_session_cookies(response: Response, access_token: str, refresh_token: str, expires_in: int) -> None:
     response.set_cookie(
         "access_token", access_token, httponly=True, secure=COOKIE_SECURE,
-        samesite="lax", max_age=expires_in, path="/",
+        samesite="none", max_age=expires_in, path="/",
     )
     response.set_cookie(
         "refresh_token", refresh_token, httponly=True, secure=COOKIE_SECURE,
-        samesite="lax", max_age=60 * 60 * 24 * 30, path="/",
+        samesite="none", max_age=60 * 60 * 24 * 30, path="/",
     )
 
 @app.post("/auth/session")

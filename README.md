@@ -2,6 +2,8 @@
 
 **SmartPrep** is a Python backend for processing university exam PDFs, extracting questions, grouping similar questions, storing results in Supabase, and exposing authenticated APIs for subject tracking and study progress.
 
+Website: https://www.smart-prep.co.in/
+
 This project currently includes:
 - PDF import and orchestration for subject processing
 - Supabase-backed auth/session handling

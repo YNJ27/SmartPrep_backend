@@ -771,6 +771,10 @@ def save_question_progress(payload: QuestionProgressPayload, current_user = Depe
         "unit_number": payload.unit_number, "group_id": payload.group_id, "question_id": payload.question_id
     }
     
+    if not payload.is_done:
+        supabase_admin.table("user_question_progress").delete().match(match_dict).execute()
+        return {"message": "Question progress deleted"}
+
     now_iso = datetime.now(timezone.utc).isoformat()
     res = supabase_admin.table("user_question_progress").update({"is_done": payload.is_done, "updated_at": now_iso}).match(match_dict).execute()
     if not res.data:
